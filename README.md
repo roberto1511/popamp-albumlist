@@ -7,6 +7,12 @@ sudo pacman -S python-gobject gtk3 python-mutagen python-pillow --needed
 ```
 
 **Installation**
+Download and copy the popamp_album_list.py file somewhere you want to store it
+Make it executable
+```
+chmod +x popamp_album_list2.py
+```
+
 Create a launcher
 ```
 vim ~/.local/share/applications/popamp-album-list.desktop
