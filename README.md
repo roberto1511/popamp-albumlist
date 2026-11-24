@@ -1,6 +1,11 @@
 # popamp-albumlist
 Is an app companion for Linux built with python Clone of the Winamp plugin AlbumList2 for popamp. 
 
+**Dependencies**
+```
+sudo pacman -S python-gobject gtk3 python-mutagen python-pillow --needed
+```
+
 **Installation**
 Create a launcher
 ```
@@ -24,5 +29,5 @@ Path=
 ```
 
 **Usage**
-Just launch it and launch popamp enjoy =)
+Just launch it and launch popamp, enjoy =)
 Is open for changes if you want to improve it
