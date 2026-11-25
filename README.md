@@ -7,19 +7,25 @@ sudo pacman -S python-gobject gtk3 python-mutagen python-pillow --needed
 ```
 
 **Installation**
+
 Download and copy the popamp_album_list.py file somewhere you want to store it
-Make it executable
+
+Make it executable:
 ```
 chmod +x popamp_album_list.py
 ```
 
-Create a launcher
+Create a launcher:
 ```
 vim ~/.local/share/applications/popamp-album-list.desktop
 ```
 
 **Example contents**
-You have to download an icon
+
+You have to download an icon I like the vinyl record icon
+
+Change the location of the file acordingly and the location of the popamp_album_list.py file"
+
 ```
 [Desktop Entry]
 Version=1.0
@@ -36,4 +42,3 @@ Path=
 
 **Usage**
 Just launch it and launch popamp, enjoy =)
-Is open for changes if you want to improve it
