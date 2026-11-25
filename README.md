@@ -1,5 +1,5 @@
 # popamp-albumlist
-Is an app companion for Linux built with python Clone of the Winamp plugin AlbumList2 for popamp. 
+Is an app companion for Linux built with python, Clone of the Winamp plugin AlbumList2 for popamp. 
 
 **Dependencies**
 ```
