@@ -43,3 +43,6 @@ Path=
 **Usage**
 
 Just launch it and play something it will launch the player window once you play an album
+
+
+Note: it will remember window position and size only tested on x11
