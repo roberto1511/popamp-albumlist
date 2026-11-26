@@ -41,4 +41,4 @@ Path=
 ```
 
 **Usage**
-Just launch it and launch popamp, enjoy =)
+Just launch it and play something it will launch the player window once you play an album
