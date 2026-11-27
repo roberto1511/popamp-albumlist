@@ -57,3 +57,5 @@ Notes:
 - This is an unofficial companion tool for Popamp. Not affiliated with or endorsed by Popamp.
 
 - The other app in the image is https://github.com/roberto1511/popamp-aurora works the same way but for displaying lyrics and artwork it will find the lyrics automatically
+
+- This is a work in progress there are improvements to be made I am not a professional if you are a professional python developer and you like this I will appreciate your contribution.
