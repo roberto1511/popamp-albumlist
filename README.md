@@ -49,7 +49,8 @@ Just launch it and play something it will launch the player window once you play
 Check out the Find album artwork... feature right clicking on an album to get the cover art
 
 Note:
-This is an unofficial companion tool for Popamp. Not affiliated with or endorsed by Popamp.
+
+- This is an unofficial companion tool for Popamp. Not affiliated with or endorsed by Popamp.
 Notes: 
 - It will remember window position and size only tested on x11
 
