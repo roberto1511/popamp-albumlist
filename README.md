@@ -55,3 +55,4 @@ Notes:
 
 - This is an unofficial companion tool for Popamp. Not affiliated with or endorsed by Popamp.
 
+- The other app in the image is https://github.com/roberto1511/popamp-aurora works the same way but for displaying lyrics and artwork it will find the lyrics automatically
