@@ -1,6 +1,7 @@
 # popamp-albumlist
 Is an app companion for Linux built with python, Clone of the Winamp plugin AlbumList2 for popamp. 
-<img width="1698" height="821" alt="image" src="https://github.com/user-attachments/assets/b9c4c43a-0b7c-45ed-96b7-32fbca8aaa30" />
+<img width="1679" height="832" alt="image" src="https://github.com/user-attachments/assets/b030cf42-b207-4757-800f-08c471db6c9a" />
+
 
 **Dependencies**
 ```
@@ -23,8 +24,6 @@ vim ~/.local/share/applications/popamp-album-list.desktop
 
 **Example contents**
 
-You have to download an icon I like the vinyl record icon
-
 Change the location of the file acordingly and the location of the popamp_album_list.py file"
 
 ```
@@ -44,6 +43,7 @@ Path=
 **Usage**
 
 Just launch it and play something it will launch the player window once you play an album
+Check out the Find album artwork... feature right clicking on an album to get the cover art
 
 
 Note: it will remember window position and size only tested on x11
