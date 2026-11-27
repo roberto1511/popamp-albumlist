@@ -1,6 +1,9 @@
 # popamp-albumlist
 Is an app companion for Linux built with python, Clone of the Winamp plugin AlbumList2 for popamp. 
-<img width="1679" height="832" alt="image" src="https://github.com/user-attachments/assets/b030cf42-b207-4757-800f-08c471db6c9a" />
+
+<img width="1465" height="830" alt="image" src="https://github.com/user-attachments/assets/a9202ae5-3e2d-4716-9d7e-633b57584c09" />
+
+<img width="1841" height="1036" alt="image" src="https://github.com/user-attachments/assets/29a17e83-8bfa-430d-a710-f4ebea0faa68" />
 
 
 **Dependencies**
