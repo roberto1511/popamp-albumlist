@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """
 Popamp Album List
 -----------------
@@ -12,6 +13,9 @@ Features
   * Full Scan: rereads tags and artwork for every album
   * Winamp .wsz / Popamp .psz palette and classic PLEDIT-sheet support
   * Skin-coloured GTK controls when a skin is selected
+  * Online album artwork search (Deezer, TheAudioDB, MusicBrainz/Cover Art Archive, iTunes) with browser-assisted Bandcamp import
+  * Batch front-cover embedding into supported audio files, with dimensions, optional folder cover and backups
+  * Optional TheAudioDB API key override via THEAUDIODB_API_KEY environment variable
 
 Arch/CachyOS dependencies:
     sudo pacman -S python-gobject gtk3 python-mutagen python-pillow
@@ -27,16 +31,23 @@ Cache:
 
 from __future__ import annotations
 
+import base64
 import configparser
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
 import os
+import shutil
+import struct
 import re
 import subprocess
 import tempfile
 import threading
+import time
+import urllib.parse
+import urllib.request
+import webbrowser
 import tomllib
 import zipfile
 import warnings
@@ -187,7 +198,7 @@ def _save_cached_cover(album_key: str, raw_bytes: bytes) -> Optional[str]:
 
 
 def _extract_embedded_art(audio_path: Path) -> Optional[bytes]:
-    """Extract common embedded artwork formats supported by Mutagen."""
+    """Extract embedded front artwork from the formats written by this app."""
     if not HAS_MUTAGEN:
         return None
 
@@ -212,13 +223,70 @@ def _extract_embedded_art(audio_path: Path) -> Optional[bytes]:
 
         else:
             media = mutagen.File(audio_path)
-            if media:
-                pictures = getattr(media, "pictures", None)
-                if pictures:
-                    return pictures[0].data
+            if not media:
+                return None
 
-                tags = getattr(media, "tags", None)
-                if tags and hasattr(tags, "getall"):
+            pictures = getattr(media, "pictures", None)
+            if pictures:
+                return pictures[0].data
+
+            tags = getattr(media, "tags", None)
+            if tags:
+                # Ogg Vorbis and Opus store FLAC picture blocks as base64.
+                encoded_pictures = tags.get("metadata_block_picture") or tags.get("METADATA_BLOCK_PICTURE")
+                if encoded_pictures:
+                    from mutagen.flac import Picture
+                    for encoded in encoded_pictures:
+                        try:
+                            block = base64.b64decode(str(encoded), validate=True)
+                            picture = Picture(block)
+                            if picture.data:
+                                return picture.data
+                        except Exception:
+                            continue
+
+                # Older Vorbis comments may use the legacy COVERART field.
+                cover_art = tags.get("coverart") or tags.get("COVERART")
+                if cover_art:
+                    values = cover_art if isinstance(cover_art, list) else [cover_art]
+                    for value in values:
+                        try:
+                            decoded = base64.b64decode(str(value), validate=True)
+                            if decoded:
+                                return decoded
+                        except Exception:
+                            continue
+
+                # APEv2 binary cover art begins with a filename and NUL byte.
+                ape_cover = tags.get("Cover Art (Front)")
+                if ape_cover:
+                    raw_value = bytes(ape_cover)
+                    _filename, separator, image_data = raw_value.partition(b"\x00")
+                    if separator and image_data:
+                        return image_data
+
+                # ASF/WMA WM/Picture stores a length-prefixed UTF-16LE payload.
+                asf_pictures = tags.get("WM/Picture")
+                if asf_pictures:
+                    for attribute in asf_pictures:
+                        try:
+                            payload = bytes(getattr(attribute, "value", attribute))
+                            if len(payload) < 7:
+                                continue
+                            _picture_type, image_length = struct.unpack_from("<BI", payload, 0)
+                            offset = 5
+                            # Skip MIME and description; both are NUL-terminated UTF-16LE.
+                            for _field in range(2):
+                                while offset + 1 < len(payload) and payload[offset:offset + 2] != b"\x00\x00":
+                                    offset += 2
+                                offset += 2
+                            image_data = payload[offset:offset + image_length]
+                            if image_data:
+                                return image_data
+                        except Exception:
+                            continue
+
+                if hasattr(tags, "getall"):
                     for frame_name in ("APIC", "covr"):
                         frames = tags.getall(frame_name)
                         if frames:
@@ -526,6 +594,566 @@ class PopampController:
     @classmethod
     def enqueue_album(cls, album: AlbumEntry) -> bool:
         return cls._launch(["popamp", "/ADD", *album.tracks]) if album.tracks else False
+
+
+# =============================================================================
+# Online artwork search and safe batch embedding
+# =============================================================================
+
+ARTWORK_USER_AGENT = "PopampAlbumList/0.4 (GTK desktop artwork manager)"
+ARTWORK_PREVIEW_DIR = CACHE_DIR / "artwork-previews"
+_ARTWORK_HTTP_TIMEOUT = 15
+_MAX_ARTWORK_BYTES = 24 * 1024 * 1024
+_musicbrainz_request_lock = threading.Lock()
+_last_musicbrainz_request = 0.0
+
+
+@dataclass
+class ArtworkResult:
+    source: str
+    artist: str
+    title: str
+    year: str
+    image_url: str
+    thumbnail_url: str = ""
+    page_url: str = ""
+    preview_path: Optional[str] = None
+    # Full-size image path is cached after a result is selected, allowing the
+    # dimensions to be shown and avoiding a second download when embedding.
+    downloaded_path: str = ""
+    local_path: str = ""
+    image_width: int = 0
+    image_height: int = 0
+
+
+def _http_bytes(url: str, timeout: int = _ARTWORK_HTTP_TIMEOUT,
+                max_bytes: int = _MAX_ARTWORK_BYTES) -> tuple[bytes, str]:
+    """Fetch a bounded response with an identifiable application User-Agent."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": ARTWORK_USER_AGENT,
+            "Accept": "application/json,image/avif,image/webp,image/png,image/jpeg,*/*;q=0.5",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        data = response.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError("The server returned an image larger than the allowed 24 MB limit.")
+    return data, content_type
+
+
+def _http_json(url: str, timeout: int = _ARTWORK_HTTP_TIMEOUT) -> dict:
+    data, _content_type = _http_bytes(url, timeout=timeout, max_bytes=5 * 1024 * 1024)
+    parsed = json.loads(data.decode("utf-8", errors="replace"))
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _search_deezer(artist: str, album: str) -> list[ArtworkResult]:
+    # Use a plain text search. Deezer's advanced artist:/album: query syntax
+    # has been intermittently unreliable, while this form remains broad and
+    # lets the user choose among matching editions in the result list.
+    query = urllib.parse.urlencode({"q": f"{artist} {album}", "limit": 12})
+    data = _http_json(f"https://api.deezer.com/search/album?{query}")
+    results: list[ArtworkResult] = []
+    for item in data.get("data", []) if isinstance(data.get("data"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        image_url = _clean_text(item.get("cover_xl") or item.get("cover_big") or item.get("cover_medium"))
+        if not image_url:
+            continue
+        artist_data = item.get("artist") if isinstance(item.get("artist"), dict) else {}
+        results.append(ArtworkResult(
+            source="Deezer",
+            artist=_clean_text(artist_data.get("name")),
+            title=_clean_text(item.get("title")),
+            year="",
+            image_url=image_url,
+            thumbnail_url=_clean_text(item.get("cover_medium") or item.get("cover_big") or image_url),
+            page_url=_clean_text(item.get("link")),
+        ))
+    return results
+
+
+def _search_itunes(artist: str, album: str) -> list[ArtworkResult]:
+    query = urllib.parse.urlencode({
+        "term": f"{artist} {album}", "entity": "album", "limit": 15,
+    })
+    data = _http_json(f"https://itunes.apple.com/search?{query}")
+    results: list[ArtworkResult] = []
+    for item in data.get("results", []) if isinstance(data.get("results"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        image_url = _clean_text(item.get("artworkUrl100") or item.get("artworkUrl60"))
+        if not image_url:
+            continue
+        # Apple's search response commonly returns a 100px image URL. Ask for
+        # a larger artwork image when its standard URL suffix is present.
+        image_url = re.sub(r"/\d+x\d+bb\.", "/1000x1000bb.", image_url)
+        thumb_url = re.sub(r"/\d+x\d+bb\.", "/160x160bb.", image_url)
+        date = _clean_text(item.get("releaseDate"))
+        year_match = re.search(r"\d{4}", date)
+        results.append(ArtworkResult(
+            source="iTunes",
+            artist=_clean_text(item.get("artistName")),
+            title=_clean_text(item.get("collectionName")),
+            year=year_match.group(0) if year_match else "",
+            image_url=image_url,
+            thumbnail_url=thumb_url,
+            page_url=_clean_text(item.get("collectionViewUrl")),
+        ))
+    return results
+
+
+def _search_theaudiodb(artist: str, album: str) -> list[ArtworkResult]:
+    """Search TheAudioDB's documented free v1 API (premium v2 needs a key)."""
+    api_key = os.environ.get("THEAUDIODB_API_KEY", "123").strip() or "123"
+    params = urllib.parse.urlencode({"s": artist, "a": album})
+    url = (
+        "https://www.theaudiodb.com/api/v1/json/"
+        f"{urllib.parse.quote(api_key, safe='')}/searchalbum.php?{params}"
+    )
+    payload = _http_json(url)
+    items = payload.get("album") if isinstance(payload.get("album"), list) else []
+
+    results: list[ArtworkResult] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        image_url = _clean_text(
+            item.get("strAlbumThumbHQ") or item.get("strAlbumThumb")
+            or item.get("strAlbumCDart")
+        )
+        if not image_url:
+            continue
+        thumbnail_url = image_url.rstrip("/") + "/small"
+        results.append(ArtworkResult(
+            source="TheAudioDB",
+            artist=_clean_text(item.get("strArtist")),
+            title=_clean_text(item.get("strAlbum")),
+            year=_clean_text(item.get("intYearReleased")),
+            image_url=image_url,
+            thumbnail_url=thumbnail_url,
+            page_url="https://www.theaudiodb.com/",
+        ))
+    return results
+
+
+def _musicbrainz_get(url: str) -> dict:
+    """Respect MusicBrainz's one-request-per-second client limit."""
+    global _last_musicbrainz_request
+    with _musicbrainz_request_lock:
+        delay = 1.05 - (time.monotonic() - _last_musicbrainz_request)
+        if delay > 0:
+            time.sleep(delay)
+        result = _http_json(url)
+        _last_musicbrainz_request = time.monotonic()
+        return result
+
+
+def _search_musicbrainz(artist: str, album: str) -> list[ArtworkResult]:
+    def lucene_escape(value: str) -> str:
+        return re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r"\\\1", value)
+
+    query_text = f'release:"{lucene_escape(album)}" AND artist:"{lucene_escape(artist)}"'
+    params = urllib.parse.urlencode({"query": query_text, "fmt": "json", "limit": 8})
+    data = _musicbrainz_get(f"https://musicbrainz.org/ws/2/release/?{params}")
+    releases = data.get("releases", []) if isinstance(data.get("releases"), list) else []
+    results: list[ArtworkResult] = []
+
+    for release in releases[:6]:
+        if not isinstance(release, dict):
+            continue
+        release_id = _clean_text(release.get("id"))
+        if not release_id:
+            continue
+        # Cover Art Archive's release endpoint returns the available image
+        # metadata; prefer the community-designated front cover.
+        try:
+            artwork = _http_json(f"https://coverartarchive.org/release/{release_id}")
+        except Exception:
+            continue
+        images = artwork.get("images", []) if isinstance(artwork.get("images"), list) else []
+        image = next((entry for entry in images if isinstance(entry, dict) and entry.get("front")), None)
+        if image is None:
+            image = next((entry for entry in images if isinstance(entry, dict)), None)
+        if not image:
+            continue
+        thumbnails = image.get("thumbnails") if isinstance(image.get("thumbnails"), dict) else {}
+        full_url = _clean_text(image.get("image"))
+        thumb_url = _clean_text(thumbnails.get("500") or thumbnails.get("250") or full_url)
+        if not full_url:
+            continue
+        credits = release.get("artist-credit", [])
+        artist_names = []
+        for credit in credits:
+            if isinstance(credit, dict):
+                name_credit = credit.get("name") or (credit.get("artist") or {}).get("name", "")
+                if name_credit:
+                    artist_names.append(str(name_credit))
+        date = _clean_text(release.get("date"))
+        year_match = re.search(r"\d{4}", date)
+        results.append(ArtworkResult(
+            source="MusicBrainz / Cover Art Archive",
+            artist=" ".join(artist_names) or artist,
+            title=_clean_text(release.get("title")) or album,
+            year=year_match.group(0) if year_match else "",
+            image_url=full_url,
+            thumbnail_url=thumb_url,
+            page_url=f"https://musicbrainz.org/release/{release_id}",
+        ))
+    return results
+
+
+def search_online_artwork(artist: str, album: str, provider: str = "all") -> list[ArtworkResult]:
+    """Search selected services; individual provider failures do not abort others."""
+    providers = {
+        "Deezer": _search_deezer,
+        "TheAudioDB": _search_theaudiodb,
+        "MusicBrainz / Cover Art Archive": _search_musicbrainz,
+        "iTunes": _search_itunes,
+    }
+    selected = list(providers.items()) if provider == "all" else (
+        [(provider, providers[provider])] if provider in providers else []
+    )
+    if not selected:
+        return []
+
+    results: list[ArtworkResult] = []
+    with ThreadPoolExecutor(max_workers=min(4, len(selected))) as executor:
+        futures = [executor.submit(func, artist, album) for _name, func in selected]
+        for future in futures:
+            try:
+                results.extend(future.result())
+            except Exception as exc:
+                print(f"[Artwork Search] Provider failed: {exc}")
+
+    # Prefer exact/close album and artist matches, then remove identical URLs.
+    def similarity(result: ArtworkResult) -> tuple[int, int]:
+        norm = lambda value: re.sub(r"[^a-z0-9]", "", value.casefold())
+        return (
+            int(norm(result.title) == norm(album)) + int(norm(result.artist) == norm(artist)),
+            int(bool(result.year)),
+        )
+
+    unique: dict[str, ArtworkResult] = {}
+    for item in sorted(results, key=similarity, reverse=True):
+        unique.setdefault(item.image_url, item)
+    return list(unique.values())[:24]
+
+
+def _write_artwork_preview(result: ArtworkResult) -> Optional[str]:
+    """Download and shrink a candidate image in a worker thread for the UI list."""
+    preview_url = result.thumbnail_url or result.image_url
+    try:
+        ARTWORK_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        name = hashlib.sha1(preview_url.encode("utf-8")).hexdigest() + ".jpg"
+        target = ARTWORK_PREVIEW_DIR / name
+        if target.is_file() and target.stat().st_size > 0:
+            return str(target)
+        raw, _mime = _http_bytes(preview_url, max_bytes=8 * 1024 * 1024)
+        if HAS_PIL:
+            with Image.open(io.BytesIO(raw)) as source:
+                image = source.convert("RGB")
+                image.thumbnail((180, 180), Image.Resampling.LANCZOS)
+                image.save(target, "JPEG", quality=84, optimize=True)
+        else:
+            # GdkPixbuf can decode the original data if Pillow is unavailable.
+            target.write_bytes(raw)
+        return str(target)
+    except Exception as exc:
+        print(f"[Artwork Search] Preview unavailable for {result.title}: {exc}")
+        return None
+
+
+def _image_dimensions_from_bytes(raw: bytes) -> tuple[int, int, str]:
+    """Return original pixel dimensions and detected MIME type."""
+    if HAS_PIL:
+        with Image.open(io.BytesIO(raw)) as image:
+            width, height = image.size
+            image_format = (image.format or "").upper()
+    else:
+        loader = GdkPixbuf.PixbufLoader.new()
+        loader.write(raw)
+        loader.close()
+        pixbuf = loader.get_pixbuf()
+        if pixbuf is None:
+            raise ValueError("The selected file is not a supported image.")
+        width, height = pixbuf.get_width(), pixbuf.get_height()
+        image_format = ""
+
+    mime = {
+        "JPEG": "image/jpeg", "JPG": "image/jpeg",
+        "PNG": "image/png", "WEBP": "image/webp",
+        "GIF": "image/gif", "BMP": "image/bmp",
+        "TIFF": "image/tiff",
+    }.get(image_format, "")
+    if not mime:
+        if raw.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
+        elif raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "image/png"
+        elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            mime = "image/webp"
+        else:
+            mime = "application/octet-stream"
+    return int(width), int(height), mime
+
+
+def _cache_selected_artwork(result: ArtworkResult) -> tuple[str, int, int, str]:
+    """Ensure the selected full-size image is local and return its dimensions."""
+    if result.local_path:
+        local = Path(result.local_path)
+        if not local.is_file():
+            raise FileNotFoundError(f"Image file no longer exists: {local}")
+        raw = local.read_bytes()
+        if len(raw) > _MAX_ARTWORK_BYTES:
+            raise ValueError("The selected image exceeds the 24 MB size limit.")
+        width, height, mime = _image_dimensions_from_bytes(raw)
+        return str(local), width, height, mime
+
+    if result.downloaded_path and Path(result.downloaded_path).is_file():
+        cached = Path(result.downloaded_path)
+        raw = cached.read_bytes()
+        width, height, mime = _image_dimensions_from_bytes(raw)
+        return str(cached), width, height, mime
+
+    if not result.image_url:
+        raise ValueError("No image URL is available for this artwork result.")
+
+    raw, _content_type = _http_bytes(result.image_url)
+    width, height, mime = _image_dimensions_from_bytes(raw)
+    ARTWORK_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(result.image_url.encode("utf-8")).hexdigest()
+    extension = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(mime, ".img")
+    target = ARTWORK_PREVIEW_DIR / f"original-{digest}{extension}"
+    temp = target.with_suffix(target.suffix + ".tmp")
+    temp.write_bytes(raw)
+    os.replace(temp, target)
+    return str(target), width, height, mime
+
+
+def _prepare_artwork_bytes(raw: bytes) -> tuple[bytes, str, str]:
+    """Validate downloaded art and normalize it to widely supported JPEG."""
+    if not raw or len(raw) > _MAX_ARTWORK_BYTES:
+        raise ValueError("Artwork is empty or exceeds the 24 MB size limit.")
+    if not HAS_PIL:
+        # Mutagen can embed the original JPEG/PNG bytes without re-encoding.
+        if raw.startswith(b"\xff\xd8\xff"):
+            return raw, "image/jpeg", ".jpg"
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return raw, "image/png", ".png"
+        raise ValueError("Pillow is required to validate this artwork format.")
+
+    with Image.open(io.BytesIO(raw)) as source:
+        image = source.convert("RGB")
+        image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=93, optimize=True)
+    return output.getvalue(), "image/jpeg", ".jpg"
+
+
+def _backup_file(path: Path) -> Path:
+    backup = path.with_name(path.name + ".bak")
+    suffix = 1
+    while backup.exists():
+        backup = path.with_name(path.name + f".bak.{suffix}")
+        suffix += 1
+    shutil.copy2(path, backup)
+    return backup
+
+
+def embed_artwork_in_file(path_string: str, artwork: bytes, mime: str,
+                          replace_existing: bool = False,
+                          create_backup: bool = False) -> str:
+    """Embed front-cover art without re-encoding audio. Return a result status."""
+    if not HAS_MUTAGEN:
+        return "unsupported: Mutagen is not installed"
+
+    path = Path(path_string)
+    try:
+        media = mutagen.File(path)
+        if media is None:
+            return "unsupported: Mutagen could not identify this file"
+
+        # MP3 and ID3-tagged WAV/AIFF.
+        from mutagen.id3 import APIC, ID3, ID3NoHeaderError
+        from mutagen.mp3 import MP3
+        from mutagen.wave import WAVE
+        from mutagen.aiff import AIFF
+        if isinstance(media, (MP3, WAVE, AIFF)):
+            if isinstance(media, MP3):
+                tags = media.tags
+                if tags is None:
+                    try:
+                        tags = ID3(path)
+                    except ID3NoHeaderError:
+                        tags = ID3()
+            else:
+                # WAVE and AIFF wrap ID3 in their own containers; save through
+                # the Mutagen file object so the tag is written to the proper chunk.
+                if media.tags is None:
+                    media.add_tags()
+                tags = media.tags
+            front_frames = [frame for frame in tags.getall("APIC") if getattr(frame, "type", 0) == 3]
+            if front_frames and not replace_existing:
+                return "skipped: artwork already exists"
+            if create_backup:
+                _backup_file(path)
+            if replace_existing:
+                tags.delall("APIC")
+            tags.add(APIC(encoding=3, mime=mime, type=3, desc="Front cover", data=artwork))
+            if isinstance(media, MP3):
+                tags.save(path, v2_version=3)
+            else:
+                media.save()
+            return "embedded"
+
+        # FLAC and Ogg-FLAC use FLAC picture blocks.
+        from mutagen.flac import FLAC, Picture
+        try:
+            from mutagen.oggflac import OggFLAC
+            flac_types = (FLAC, OggFLAC)
+        except ImportError:
+            flac_types = (FLAC,)
+        if isinstance(media, flac_types):
+            existing = bool(getattr(media, "pictures", []))
+            if existing and not replace_existing:
+                return "skipped: artwork already exists"
+            if create_backup:
+                _backup_file(path)
+            if replace_existing:
+                media.clear_pictures()
+            picture = Picture()
+            picture.type = 3
+            picture.mime = mime
+            picture.desc = "Front cover"
+            picture.data = artwork
+            media.add_picture(picture)
+            media.save()
+            return "embedded"
+
+        # Ogg Vorbis and Opus store the FLAC picture block as base64 metadata.
+        from mutagen.oggvorbis import OggVorbis
+        from mutagen.oggopus import OggOpus
+        if isinstance(media, (OggVorbis, OggOpus)):
+            from mutagen.flac import Picture
+            existing = bool(getattr(media, "pictures", [])) or bool(media.get("metadata_block_picture"))
+            if existing and not replace_existing:
+                return "skipped: artwork already exists"
+            if create_backup:
+                _backup_file(path)
+            picture = Picture()
+            picture.type = 3
+            picture.mime = mime
+            picture.desc = "Front cover"
+            picture.data = artwork
+            media["metadata_block_picture"] = [base64.b64encode(picture.write()).decode("ascii")]
+            # Remove legacy Vorbis picture fields when replacing, so readers do
+            # not display both stale and new artwork.
+            if replace_existing:
+                for key in ("coverart", "coverartmime"):
+                    if key in media:
+                        del media[key]
+            media.save()
+            return "embedded"
+
+        # MP4/M4A artwork uses the covr atom.
+        from mutagen.mp4 import MP4, MP4Cover
+        if isinstance(media, MP4):
+            tags = media.tags
+            existing = bool(tags and tags.get("covr"))
+            if existing and not replace_existing:
+                return "skipped: artwork already exists"
+            if create_backup:
+                _backup_file(path)
+            if media.tags is None:
+                media.add_tags()
+            image_format = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
+            media.tags["covr"] = [MP4Cover(artwork, imageformat=image_format)]
+            media.save()
+            return "embedded"
+
+        # Windows Media / ASF (WMA) stores pictures in WM/Picture byte arrays.
+        # The payload is: picture type, little-endian byte length, UTF-16LE MIME,
+        # UTF-16LE description, and the raw image bytes.
+        from mutagen.asf import ASF, ASFByteArrayAttribute
+        if isinstance(media, ASF):
+            values = media.tags.get("WM/Picture", []) if media.tags else []
+            if values and not replace_existing:
+                return "skipped: artwork already exists"
+            if create_backup:
+                _backup_file(path)
+            if media.tags is None:
+                media.add_tags()
+            if replace_existing and "WM/Picture" in media.tags:
+                del media.tags["WM/Picture"]
+            mime_data = mime.encode("utf-16-le") + b"\x00\x00"
+            description_data = "Front cover".encode("utf-16-le") + b"\x00\x00"
+            payload = (
+                struct.pack("<BI", 3, len(artwork))
+                + mime_data + description_data + artwork
+            )
+            media.tags["WM/Picture"] = [ASFByteArrayAttribute(payload)]
+            media.save()
+            return "embedded"
+
+        # APEv2-based containers such as APE, WavPack and Musepack.
+        from mutagen.apev2 import APEBinaryValue
+        from mutagen.wavpack import WavPack
+        from mutagen.musepack import Musepack
+        if isinstance(media, (WavPack, Musepack)) or path.suffix.lower() == ".ape":
+            tags = media.tags
+            if tags is None:
+                media.add_tags()
+                tags = media.tags
+            existing = bool(tags and tags.get("Cover Art (Front)"))
+            if existing and not replace_existing:
+                return "skipped: artwork already exists"
+            if create_backup:
+                _backup_file(path)
+            tags["Cover Art (Front)"] = APEBinaryValue(b"Cover.jpg\x00" + artwork)
+            media.save()
+            return "embedded"
+
+        return "unsupported: this audio container has no safe artwork writer in this version"
+
+    except Exception as exc:
+        return f"failed: {exc}"
+
+
+def save_folder_artwork(folder_string: str, artwork: bytes,
+                        replace_existing: bool = False) -> str:
+    """Save a conventional cover.jpg without silently overwriting an existing cover."""
+    folder = Path(folder_string)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        existing = _find_folder_cover(folder)
+        target = folder / "cover.jpg"
+        if existing and not replace_existing:
+            return "skipped: folder artwork already exists"
+        if target.exists() and not replace_existing:
+            return "skipped: cover.jpg already exists"
+        # Folder images are small, so retain a backup automatically whenever
+        # Replace is selected, even when the old file has another conventional name.
+        if existing and Path(existing).is_file():
+            _backup_file(Path(existing))
+        if target.exists() and (not existing or Path(existing).resolve() != target.resolve()):
+            _backup_file(target)
+        temp = target.with_suffix(target.suffix + ".tmp")
+        temp.write_bytes(artwork)
+        os.replace(temp, target)
+        return str(target)
+    except Exception as exc:
+        return f"failed: {exc}"
+
 
 
 # =============================================================================
@@ -837,6 +1465,9 @@ class AlbumListWindow(Gtk.Window):
         self._cover_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="PopampCover"
         )
+        self._artwork_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="PopampArtwork"
+        )
 
         self.view_mode = self.config.get("view_mode", "grid")
         if self.view_mode not in {"grid", "list"}:
@@ -844,6 +1475,7 @@ class AlbumListWindow(Gtk.Window):
 
         self.scan_in_progress = False
         self.scan_summary = "Library not scanned yet"
+        self._shutting_down = False
         self.css_provider = Gtk.CssProvider()
         self.css_installed = False
 
@@ -1024,15 +1656,17 @@ class AlbumListWindow(Gtk.Window):
         return False
 
     def _on_window_destroy(self, _window) -> None:
-        """Final geometry flush and non-blocking shutdown of cover workers."""
+        """Final geometry flush and non-blocking shutdown of background workers."""
+        self._shutting_down = True
         if self._geometry_save_source is not None:
             GLib.source_remove(self._geometry_save_source)
             self._geometry_save_source = None
         self._save_window_geometry()
-        try:
-            self._cover_executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:  # Compatibility with older Python versions.
-            self._cover_executor.shutdown(wait=False)
+        for executor in (self._cover_executor, self._artwork_executor):
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:  # Compatibility with older Python versions.
+                executor.shutdown(wait=False)
 
     # -------------------------------------------------------------------------
     # Theme CSS
@@ -1196,6 +1830,17 @@ class AlbumListWindow(Gtk.Window):
             background-color: {theme['normal_bg']};
             color: {theme['normal_text']};
             border: none;
+        }}
+        listbox, listboxrow {{
+            background-color: {theme['normal_bg']};
+            color: {theme['normal_text']};
+        }}
+        listboxrow:selected {{
+            background-color: {theme['selected_bg']};
+            color: {theme['current_text']};
+        }}
+        frame {{
+            border: 1px solid {theme['border_dark']};
         }}
         flowboxchild {{
             padding: 5px;
@@ -2027,12 +2672,489 @@ class AlbumListWindow(Gtk.Window):
         menu.append(enqueue_item)
 
         menu.append(Gtk.SeparatorMenuItem())
+        artwork_item = Gtk.MenuItem(label="Find album artwork…")
+        artwork_item.set_tooltip_text("Search online, preview covers, and embed the selected cover into this album")
+        artwork_item.connect("activate", lambda _item: self._open_artwork_finder(album))
+        menu.append(artwork_item)
+
         open_item = Gtk.MenuItem(label="Open album folder")
         open_item.connect("activate", lambda _item: self._open_album_folder(album))
         menu.append(open_item)
 
         menu.show_all()
         menu.popup_at_pointer(event)
+
+    def _open_artwork_finder(self, album: AlbumEntry) -> None:
+        """Search, preview and batch-apply artwork for one album."""
+        dialog = Gtk.Dialog(
+            title=f"Find Album Artwork — {album.album}",
+            parent=self,
+            flags=Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
+        )
+        dialog.set_default_size(880, 620)
+        dialog.set_border_width(8)
+        dialog.get_content_area().get_style_context().add_class("winamp-root")
+        dialog.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
+        apply_button = dialog.add_button("EMBED ARTWORK", Gtk.ResponseType.OK)
+        apply_button.set_sensitive(False)
+        apply_button.get_style_context().add_class("skin-button")
+        dialog.set_default_response(Gtk.ResponseType.OK)
+
+        content = dialog.get_content_area()
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_margin_start(4)
+        outer.set_margin_end(4)
+        outer.set_margin_top(4)
+        outer.set_margin_bottom(4)
+        content.pack_start(outer, True, True, 0)
+
+        intro = Gtk.Label(label=f"Search for a cover for {album.artist} — {album.album}")
+        intro.set_xalign(0.0)
+        intro.get_style_context().add_class("album-title")
+        outer.pack_start(intro, False, False, 0)
+
+        query_grid = Gtk.Grid()
+        query_grid.set_column_spacing(6)
+        query_grid.set_row_spacing(5)
+        outer.pack_start(query_grid, False, False, 0)
+
+        artist_entry = Gtk.Entry()
+        artist_entry.set_text(album.artist)
+        artist_entry.set_placeholder_text("Artist")
+        album_entry = Gtk.Entry()
+        album_entry.set_text(album.album)
+        album_entry.set_placeholder_text("Album")
+        provider_combo = Gtk.ComboBoxText()
+        provider_combo.append("all", "All sources")
+        provider_combo.append("Deezer", "Deezer")
+        provider_combo.append("TheAudioDB", "TheAudioDB")
+        provider_combo.append("MusicBrainz / Cover Art Archive", "MusicBrainz / Cover Art Archive")
+        provider_combo.append("iTunes", "iTunes")
+        provider_combo.set_active_id("all")
+
+        search_button = Gtk.Button(label="SEARCH")
+        search_button.get_style_context().add_class("skin-button")
+        bandcamp_button = Gtk.Button(label="BANDCAMP SEARCH")
+        bandcamp_button.get_style_context().add_class("skin-button")
+        bandcamp_button.set_tooltip_text(
+            "Open Bandcamp's own search in your browser. Save a cover image there, then import it here."
+        )
+        import_button = Gtk.Button(label="IMPORT IMAGE…")
+        import_button.get_style_context().add_class("skin-button")
+        import_button.set_tooltip_text("Use an image already saved on your computer")
+
+        query_grid.attach(Gtk.Label(label="Artist"), 0, 0, 1, 1)
+        query_grid.attach(artist_entry, 1, 0, 2, 1)
+        query_grid.attach(Gtk.Label(label="Album"), 3, 0, 1, 1)
+        query_grid.attach(album_entry, 4, 0, 2, 1)
+        query_grid.attach(provider_combo, 0, 1, 2, 1)
+        query_grid.attach(search_button, 2, 1, 1, 1)
+        query_grid.attach(bandcamp_button, 3, 1, 1, 1)
+        query_grid.attach(import_button, 4, 1, 2, 1)
+
+        status = Gtk.Label(label="Searching artwork sources…")
+        status.set_xalign(0.0)
+        outer.pack_start(status, False, False, 0)
+
+        results_scroll = Gtk.ScrolledWindow()
+        results_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        results_scroll.set_min_content_height(260)
+        results_list = Gtk.ListBox()
+        results_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        results_list.set_activate_on_single_click(False)
+        results_scroll.add(results_list)
+        outer.pack_start(results_scroll, True, True, 0)
+
+        selected_info = Gtk.Label(label="Select a result to inspect its original pixel dimensions.")
+        selected_info.set_xalign(0.0)
+        selected_info.get_style_context().add_class("album-artist")
+        outer.pack_start(selected_info, False, False, 0)
+
+        options_frame = Gtk.Frame(label="Apply selected artwork")
+        options_grid = Gtk.Grid()
+        options_grid.set_margin_start(8)
+        options_grid.set_margin_end(8)
+        options_grid.set_margin_top(6)
+        options_grid.set_margin_bottom(6)
+        options_grid.set_row_spacing(4)
+        options_frame.add(options_grid)
+        outer.pack_start(options_frame, False, False, 0)
+
+        embed_check = Gtk.CheckButton(label=f"Embed into all {len(album.tracks)} audio files")
+        embed_check.set_active(True)
+        folder_check = Gtk.CheckButton(label="Also save cover.jpg in the album folder")
+        folder_check.set_active(True)
+        replace_check = Gtk.CheckButton(label="Replace existing embedded/folder artwork")
+        replace_check.set_active(False)
+        backup_check = Gtk.CheckButton(label="Create .bak copies before changing audio tags")
+        backup_check.set_active(False)
+        for row_index, check in enumerate((embed_check, folder_check, replace_check, backup_check)):
+            options_grid.attach(check, 0, row_index, 1, 1)
+
+        dialog.selected_artwork = None
+        dialog.search_generation = 0
+        dialog.selection_generation = 0
+
+        def add_result_row(result: ArtworkResult, select: bool = False) -> Gtk.ListBoxRow:
+            row = Gtk.ListBoxRow()
+            row.set_selectable(True)
+            row.set_activatable(True)
+            row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            row_box.set_margin_start(6)
+            row_box.set_margin_end(6)
+            row_box.set_margin_top(5)
+            row_box.set_margin_bottom(5)
+
+            image_source = result.preview_path or result.local_path or result.downloaded_path
+            if image_source and Path(image_source).is_file():
+                try:
+                    cover_pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(image_source, 84, 84, True)
+                    cover_image = Gtk.Image.new_from_pixbuf(cover_pb)
+                except Exception:
+                    cover_image = Gtk.Image.new_from_icon_name("image-x-generic", Gtk.IconSize.DIALOG)
+            else:
+                cover_image = Gtk.Image.new_from_icon_name("image-x-generic", Gtk.IconSize.DIALOG)
+            cover_image.set_size_request(84, 84)
+            row_box.pack_start(cover_image, False, False, 0)
+
+            details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            name = Gtk.Label(label=result.title or "Unknown album")
+            name.set_xalign(0.0)
+            name.set_ellipsize(Pango.EllipsizeMode.END)
+            name.get_style_context().add_class("album-title")
+            meta = Gtk.Label(label=" — ".join(part for part in (result.artist, result.year, result.source) if part))
+            meta.set_xalign(0.0)
+            meta.set_ellipsize(Pango.EllipsizeMode.END)
+            meta.get_style_context().add_class("album-artist")
+            pixel_label = Gtk.Label(
+                label=(f"{result.image_width} × {result.image_height} px" if result.image_width and result.image_height
+                       else "Original dimensions: select to inspect")
+            )
+            pixel_label.set_xalign(0.0)
+            pixel_label.get_style_context().add_class("album-artist")
+            details.pack_start(name, False, False, 0)
+            details.pack_start(meta, False, False, 0)
+            details.pack_start(pixel_label, False, False, 0)
+            row_box.pack_start(details, True, True, 0)
+            row.add(row_box)
+            row.artwork_result = result
+            row.pixel_label = pixel_label
+            results_list.add(row)
+            if select:
+                results_list.select_row(row)
+            return row
+
+        def display_results(found: list[ArtworkResult], generation: int,
+                            error: Optional[str] = None) -> bool:
+            try:
+                if not dialog.get_visible() or generation != dialog.search_generation:
+                    return False
+            except (RuntimeError, AttributeError):
+                return False
+            for child in results_list.get_children():
+                results_list.remove(child)
+            dialog.selected_artwork = None
+            apply_button.set_sensitive(False)
+            selected_info.set_text("Select a result to inspect its original pixel dimensions.")
+            if error:
+                status.set_text(error)
+            elif not found:
+                status.set_text("No artwork found. Try another source or adjust the artist/album names.")
+            else:
+                status.set_text(f"{len(found)} artwork results — select the edition that matches your album.")
+            for result in found:
+                add_result_row(result)
+            results_list.show_all()
+            return False
+
+        def do_search(_button=None) -> None:
+            artist_query = artist_entry.get_text().strip()
+            album_query = album_entry.get_text().strip()
+            if not artist_query or not album_query:
+                status.set_text("Enter both an artist and an album name.")
+                return
+            dialog.search_generation += 1
+            generation = dialog.search_generation
+            provider_id = provider_combo.get_active_id() or "all"
+            search_button.set_sensitive(False)
+            status.set_text("Searching artwork sources and loading previews…")
+            for child in results_list.get_children():
+                results_list.remove(child)
+            dialog.selected_artwork = None
+            apply_button.set_sensitive(False)
+            selected_info.set_text("Select a result to inspect its original pixel dimensions.")
+
+            def worker() -> None:
+                try:
+                    found = search_online_artwork(artist_query, album_query, provider_id)
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        futures = [executor.submit(_write_artwork_preview, item) for item in found]
+                        for item, future in zip(found, futures):
+                            try:
+                                item.preview_path = future.result()
+                            except Exception:
+                                item.preview_path = None
+                    GLib.idle_add(display_results, found, generation, None)
+                except Exception as exc:
+                    GLib.idle_add(display_results, [], generation, f"Artwork search failed: {exc}")
+                finally:
+                    def restore_search_button() -> bool:
+                        try:
+                            if dialog.get_visible():
+                                search_button.set_sensitive(True)
+                        except (RuntimeError, AttributeError):
+                            pass
+                        return False
+                    GLib.idle_add(restore_search_button)
+
+            threading.Thread(target=worker, name="PopampArtworkSearch", daemon=True).start()
+
+        def on_selection_changed(_listbox, selected_row) -> None:
+            """Gtk.ListBox.row-selected supplies BOTH listbox and row."""
+            result = getattr(selected_row, "artwork_result", None) if selected_row else None
+            dialog.selected_artwork = result
+            # This was the bug in the previous build: the signal passes two
+            # parameters, but its callback accepted only one, so it raised a
+            # TypeError and the Apply button remained disabled.
+            apply_button.set_sensitive(result is not None)
+            dialog.selection_generation += 1
+            generation = dialog.selection_generation
+            if result is None:
+                selected_info.set_text("Select a result to inspect its original pixel dimensions.")
+                return
+            if result.image_width and result.image_height:
+                selected_info.set_text(f"Original image: {result.image_width} × {result.image_height} pixels")
+                return
+
+            selected_info.set_text("Selected — checking original image dimensions…")
+
+            def probe_worker() -> None:
+                try:
+                    path, width, height, mime = _cache_selected_artwork(result)
+                    result.downloaded_path = path if not result.local_path else ""
+                    result.image_width = width
+                    result.image_height = height
+                    result.mime_type = mime
+                    GLib.idle_add(update_selected_dimensions, result, generation, None)
+                except Exception as exc:
+                    GLib.idle_add(update_selected_dimensions, result, generation, str(exc))
+
+            threading.Thread(target=probe_worker, name="PopampArtworkDimensions", daemon=True).start()
+
+        def update_selected_dimensions(result: ArtworkResult, generation: int,
+                                       error: Optional[str]) -> bool:
+            try:
+                if not dialog.get_visible() or generation != dialog.selection_generation:
+                    return False
+            except (RuntimeError, AttributeError):
+                return False
+            if error:
+                selected_info.set_text(f"Dimensions unavailable: {error}")
+                return False
+            selected_info.set_text(
+                f"Original image: {result.image_width} × {result.image_height} pixels"
+            )
+            row = results_list.get_selected_row()
+            if row and getattr(row, "artwork_result", None) is result:
+                row.pixel_label.set_text(f"{result.image_width} × {result.image_height} px")
+            return False
+
+        def open_bandcamp(_button=None) -> None:
+            artist_query = artist_entry.get_text().strip()
+            album_query = album_entry.get_text().strip()
+            if not artist_query or not album_query:
+                status.set_text("Enter both an artist and album before opening Bandcamp search.")
+                return
+            query = urllib.parse.urlencode({"q": f"{artist_query} {album_query}"})
+            url = f"https://bandcamp.com/search?{query}"
+            try:
+                webbrowser.open_new_tab(url)
+                status.set_text(
+                    "Bandcamp opened in your browser. Save the desired cover image, then choose IMPORT IMAGE."
+                )
+            except Exception as exc:
+                status.set_text(f"Could not open Bandcamp: {exc}")
+
+        def import_local_image(_button=None) -> None:
+            chooser = Gtk.FileChooserDialog(
+                title="Import album artwork image",
+                parent=dialog,
+                action=Gtk.FileChooserAction.OPEN,
+            )
+            chooser.add_buttons(
+                Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+            )
+            image_filter = Gtk.FileFilter()
+            image_filter.set_name("Image files (JPEG, PNG, WebP, TIFF, BMP)")
+            for pattern in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.tif", "*.tiff", "*.bmp"):
+                image_filter.add_pattern(pattern)
+                image_filter.add_pattern(pattern.upper())
+            chooser.add_filter(image_filter)
+            response = chooser.run()
+            filename = chooser.get_filename() if response == Gtk.ResponseType.OK else None
+            chooser.destroy()
+            if not filename:
+                return
+            try:
+                image_path = Path(filename)
+                raw = image_path.read_bytes()
+                if not raw or len(raw) > _MAX_ARTWORK_BYTES:
+                    raise ValueError("Image is empty or larger than the 24 MB limit.")
+                width, height, mime = _image_dimensions_from_bytes(raw)
+                local_result = ArtworkResult(
+                    source="Local image",
+                    artist=album.artist,
+                    title=album.album,
+                    year=album.year,
+                    image_url="",
+                    preview_path=str(image_path),
+                    local_path=str(image_path),
+                    image_width=width,
+                    image_height=height,
+                )
+                local_result.mime_type = mime
+                add_result_row(local_result, select=True)
+                results_list.show_all()
+                status.set_text("Local artwork loaded. Review the dimensions and apply it to this album.")
+            except Exception as exc:
+                status.set_text(f"Could not load image: {exc}")
+
+        results_list.connect("row-selected", on_selection_changed)
+        search_button.connect("clicked", do_search)
+        bandcamp_button.connect("clicked", open_bandcamp)
+        import_button.connect("clicked", import_local_image)
+        album_entry.connect("activate", do_search)
+        artist_entry.connect("activate", do_search)
+        dialog.show_all()
+        do_search()
+        response = dialog.run()
+        selected_artwork = dialog.selected_artwork
+        options = {
+            "embed": embed_check.get_active(),
+            "save_folder": folder_check.get_active(),
+            "replace": replace_check.get_active(),
+            "backup": backup_check.get_active(),
+        }
+        dialog.destroy()
+
+        if response == Gtk.ResponseType.OK and selected_artwork:
+            if not options["embed"] and not options["save_folder"]:
+                self.status_label.set_text("Choose embedding and/or folder artwork before applying.")
+                return
+            self._apply_album_artwork(album, selected_artwork, options)
+
+    def _apply_album_artwork(self, album: AlbumEntry, result: ArtworkResult,
+                             options: dict[str, bool]) -> None:
+        """Download once, then embed the same image into all selected album files."""
+        self.status_label.set_text(f"Downloading artwork for {album.album}…")
+        self.btn_quick_scan.set_sensitive(False)
+        self.btn_full_scan.set_sensitive(False)
+
+        def update_progress(message: str) -> None:
+            GLib.idle_add(self._set_artwork_status, message)
+
+        def worker() -> None:
+            embedded = skipped = unsupported = failed = 0
+            first_track_result = "not processed"
+            folder_result = "not requested"
+            try:
+                if result.local_path and Path(result.local_path).is_file():
+                    raw = Path(result.local_path).read_bytes()
+                elif result.downloaded_path and Path(result.downloaded_path).is_file():
+                    raw = Path(result.downloaded_path).read_bytes()
+                else:
+                    raw, _content_type = _http_bytes(result.image_url)
+                artwork, mime, _extension = _prepare_artwork_bytes(raw)
+                if options.get("save_folder"):
+                    folder_result = save_folder_artwork(
+                        album.folder_path, artwork, options.get("replace", False)
+                    )
+                if options.get("embed"):
+                    total = len(album.tracks)
+                    for index, track in enumerate(album.tracks, start=1):
+                        update_progress(f"Embedding artwork: {index}/{total} — {Path(track).name}")
+                        outcome = embed_artwork_in_file(
+                            track, artwork, mime,
+                            replace_existing=options.get("replace", False),
+                            create_backup=options.get("backup", False),
+                        )
+                        if index == 1:
+                            first_track_result = outcome
+                        if outcome == "embedded":
+                            embedded += 1
+                        elif outcome.startswith("skipped"):
+                            skipped += 1
+                        elif outcome.startswith("unsupported"):
+                            unsupported += 1
+                        else:
+                            failed += 1
+                result_data = {
+                    "embedded": embedded,
+                    "skipped": skipped,
+                    "unsupported": unsupported,
+                    "failed": failed,
+                    "folder": folder_result,
+                    "first_track": first_track_result,
+                    "artwork": artwork,
+                    "error": None,
+                }
+            except Exception as exc:
+                result_data = {
+                    "embedded": embedded,
+                    "skipped": skipped,
+                    "unsupported": unsupported,
+                    "failed": failed,
+                    "folder": folder_result,
+                    "first_track": first_track_result,
+                    "artwork": None,
+                    "error": str(exc),
+                }
+            GLib.idle_add(self._finish_album_artwork, album, result_data)
+
+        self._artwork_executor.submit(worker)
+
+    def _set_artwork_status(self, message: str) -> bool:
+        if self._shutting_down:
+            return False
+        try:
+            self.status_label.set_text(message)
+        except (RuntimeError, AttributeError):
+            pass
+        return False
+
+    def _finish_album_artwork(self, album: AlbumEntry, result: dict) -> bool:
+        if self._shutting_down:
+            return False
+        self.btn_quick_scan.set_sensitive(True)
+        self.btn_full_scan.set_sensitive(True)
+        if result.get("error"):
+            self.status_label.set_text(f"Artwork operation failed: {result['error']}")
+            return False
+
+        embedded = result.get("embedded", 0)
+        skipped = result.get("skipped", 0)
+        unsupported = result.get("unsupported", 0)
+        failed = result.get("failed", 0)
+        folder_result = result.get("folder", "not requested")
+        if isinstance(folder_result, str) and folder_result.startswith("/"):
+            album.cover_cache_path = folder_result
+        elif result.get("artwork") and (
+            result.get("first_track") == "embedded"
+            or (isinstance(folder_result, str) and folder_result.startswith("/"))
+        ):
+            cache_path = _save_cached_cover(album.album_id, result["artwork"])
+            if cache_path:
+                album.cover_cache_path = cache_path
+
+        self.status_label.set_text(
+            f"Artwork applied to {album.album}: {embedded} embedded, {skipped} already had art, "
+            f"{unsupported} unsupported, {failed} failed. Folder: {folder_result}"
+        )
+        # Refresh the library signatures so the next quick scan sees the new
+        # tag timestamps and folder artwork, without changing the audio data.
+        self.start_quick_scan()
+        return False
 
     def _open_album_folder(self, album: AlbumEntry) -> None:
         try:
