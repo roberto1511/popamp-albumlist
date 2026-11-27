@@ -50,6 +50,8 @@ Check out the Find album artwork... feature right clicking on an album to get th
 
 Note:
 This is an unofficial companion tool for Popamp. Not affiliated with or endorsed by Popamp.
-Note: it will remember window position and size only tested on x11
+Notes: 
+- It will remember window position and size only tested on x11
 
-n unofficial companion tool for Popamp. Not affiliated with or endorsed by Popamp.
+- This is an unofficial companion tool for Popamp. Not affiliated with or endorsed by Popamp.
+
